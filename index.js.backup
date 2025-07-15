@@ -1,0 +1,711 @@
+const express = require('express');
+const cors = require('cors');
+const cookieParser = require('cookie-parser');
+const mongoose = require('mongoose');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const dotenv = require('dotenv');
+const multer = require('multer');
+const cloudinary = require('cloudinary').v2;
+const streamifier = require('streamifier');
+const { Server } = require('socket.io');
+const Razorpay = require('razorpay');
+
+// Load environment variables
+dotenv.config();
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+// Middleware
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  credentials: true
+}));
+app.use(express.json());
+app.use(cookieParser());
+
+// MongoDB connection
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/auth-app')
+  .then(() => console.log('Connected to MongoDB'))
+  .catch(err => console.error('MongoDB connection error:', err));
+
+// User Schema
+const userSchema = new mongoose.Schema({
+  name: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  email: {
+    type: String,
+    required: true,
+    unique: true,
+    trim: true,
+    lowercase: true
+  },
+  password: {
+    type: String,
+    required: true
+  },
+  otp: {
+    type: String,
+    default: null
+  },
+  otpExpiry: {
+    type: Date,
+    default: null
+  },
+  otpType: {
+    type: String, // 'login' or 'reset'
+    default: null
+  },
+  profilePic: {
+    type: String,
+    default: null
+  },
+  isGroupMember: {
+    type: Boolean,
+    default: false
+  }
+}, {
+  timestamps: true
+});
+
+const User = mongoose.model('User', userSchema);
+
+// OTP utility
+const generateOTP = () => {
+  return Math.floor(100000 + Math.random() * 900000).toString(); // 6-digit OTP
+};
+
+// Nodemailer (Ethereal) setup
+const nodemailer = require('nodemailer');
+let etherealAccount = null;
+let transporter = null;
+
+async function getEtherealTransporter() {
+  if (!etherealAccount) {
+    etherealAccount = await nodemailer.createTestAccount();
+    transporter = nodemailer.createTransport({
+      host: 'smtp.ethereal.email',
+      port: 587,
+      auth: {
+        user: etherealAccount.user,
+        pass: etherealAccount.pass
+      }
+    });
+  }
+  return transporter;
+}
+
+async function sendOTPEmail(to, otp, type = 'login') {
+  const transport = await getEtherealTransporter();
+  const subject = type === 'login' ? 'Your Login OTP' : 'Your Password Reset OTP';
+  const info = await transport.sendMail({
+    from: 'no-reply@example.com',
+    to,
+    subject,
+    text: `Your OTP is: ${otp}. It is valid for 5 minutes.`
+  });
+  console.log('OTP email sent:', nodemailer.getTestMessageUrl(info));
+}
+
+// Password validation middleware
+const validatePassword = (password) => {
+  const minLength = password.length >= 8;
+  const hasUpperCase = /[A-Z]/.test(password);
+  const hasLowerCase = /[a-z]/.test(password);
+  const hasNumber = /\d/.test(password);
+  const hasSpecialChar = /[!@#$%^&*(),.?":{}|<>]/.test(password);
+
+  const errors = [];
+  if (!minLength) errors.push('Password must be at least 8 characters long');
+  if (!hasUpperCase) errors.push('Password must contain at least one uppercase letter');
+  if (!hasLowerCase) errors.push('Password must contain at least one lowercase letter');
+  if (!hasNumber) errors.push('Password must contain at least one number');
+  if (!hasSpecialChar) errors.push('Password must contain at least one special character');
+
+  return {
+    isValid: errors.length === 0,
+    errors
+  };
+};
+
+// JWT middleware
+const generateToken = (userId) => {
+  return jwt.sign({ userId }, process.env.JWT_SECRET || 'your-secret-key', {
+    expiresIn: '7d'
+  });
+};
+
+const authenticateToken = async (req, res, next) => {
+  const token = req.cookies?.token;
+
+  if (!token) {
+    return res.status(401).json({ message: 'Access token required' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const user = await User.findById(decoded.userId).select('-password');
+    
+    if (!user) {
+      return res.status(401).json({ message: 'Invalid token' });
+    }
+
+    req.user = user;
+    next();
+  } catch (error) {
+    return res.status(401).json({ message: 'Invalid token' });
+  }
+};
+
+// Cloudinary config
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || 'your_cloud_name',
+  api_key: process.env.CLOUDINARY_API_KEY || 'your_api_key',
+  api_secret: process.env.CLOUDINARY_API_SECRET || 'your_api_secret',
+});
+
+// Razorpay config (test keys)
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_51H2X2X2X2X2X2',
+  key_secret: process.env.RAZORPAY_KEY_SECRET || 'test_secret_key_here'
+});
+
+// Multer setup (memory storage)
+const upload = multer({ storage: multer.memoryStorage() });
+
+// Upload profile picture endpoint
+app.put('/api/profile/picture', authenticateToken, upload.single('profilePic'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No file uploaded' });
+    }
+    // Upload to Cloudinary
+    const streamUpload = (fileBuffer) => {
+      return new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          { folder: 'profile_pics', resource_type: 'image' },
+          (error, result) => {
+            if (result) {
+              resolve(result);
+            } else {
+              reject(error);
+            }
+          }
+        );
+        streamifier.createReadStream(fileBuffer).pipe(stream);
+      });
+    };
+    const result = await streamUpload(req.file.buffer);
+    // Save URL to user profile
+    req.user.profilePic = result.secure_url;
+    await req.user.save();
+    res.json({
+      message: 'Profile picture updated',
+      profilePic: req.user.profilePic
+    });
+  } catch (error) {
+    console.error('Profile picture upload error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Routes
+
+// Register
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+
+    // Validate input
+    if (!name || !email || !password) {
+      return res.status(400).json({ message: 'All fields are required' });
+    }
+
+    // Validate password
+    const passwordValidation = validatePassword(password);
+    if (!passwordValidation.isValid) {
+      return res.status(400).json({ 
+        message: 'Password validation failed',
+        errors: passwordValidation.errors
+      });
+    }
+
+    // Check if user already exists
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ message: 'User already exists with this email' });
+    }
+
+    // Hash password
+    const saltRounds = 12;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+
+    // Create user
+    const user = new User({
+      name,
+      email,
+      password: hashedPassword
+    });
+
+    await user.save();
+
+    // Generate token
+    const token = generateToken(user._id);
+
+    // Set HttpOnly cookie
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+    });
+
+    // Return user data (without password)
+    const userResponse = {
+      _id: user._id,
+      name: user.name,
+      email: user.email,
+      createdAt: user.createdAt
+    };
+
+    res.status(201).json({
+      message: 'User registered successfully',
+      user: userResponse
+    });
+
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    // Validate input
+    if (!email || !password) {
+      return res.status(400).json({ message: 'Email and password are required' });
+    }
+
+    // Find user
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(401).json({ message: 'Invalid email or password' });
+    }
+
+    // Verify password
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) {
+      return res.status(401).json({ message: 'Invalid email or password' });
+    }
+
+    // Generate OTP
+    const otp = generateOTP();
+    const otpExpiry = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+    user.otp = otp;
+    user.otpExpiry = otpExpiry;
+    user.otpType = 'login';
+    await user.save();
+
+    // Send OTP email
+    await sendOTPEmail(user.email, otp, 'login');
+
+    return res.json({
+      message: 'OTP sent to your email. Please verify to complete login.',
+      email: user.email
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Verify OTP for login
+app.post('/api/auth/verify-otp', async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp) {
+      return res.status(400).json({ message: 'Email and OTP are required' });
+    }
+    const user = await User.findOne({ email });
+    if (!user || user.otp !== otp || user.otpType !== 'login') {
+      return res.status(401).json({ message: 'Invalid OTP' });
+    }
+    if (!user.otpExpiry || user.otpExpiry < new Date()) {
+      return res.status(401).json({ message: 'OTP expired' });
+    }
+    // Clear OTP fields
+    user.otp = null;
+    user.otpExpiry = null;
+    user.otpType = null;
+    await user.save();
+    // Generate token
+    const token = generateToken(user._id);
+    // Set HttpOnly cookie
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+    });
+    // Return user data (without password)
+    const userResponse = {
+      _id: user._id,
+      name: user.name,
+      email: user.email,
+      createdAt: user.createdAt
+    };
+    res.json({
+      message: 'Login successful',
+      user: userResponse
+    });
+  } catch (error) {
+    console.error('OTP verification error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Logout
+app.post('/api/auth/logout', (req, res) => {
+  res.clearCookie('token');
+  res.json({ message: 'Logged out successfully' });
+});
+
+// Get current user
+app.get('/api/auth/me', authenticateToken, (req, res) => {
+  res.json({ user: req.user });
+});
+
+// Get user profile
+app.get('/api/profile', authenticateToken, (req, res) => {
+  res.json({ user: req.user });
+});
+
+// Update user profile
+app.put('/api/profile', authenticateToken, async (req, res) => {
+  try {
+    const { name } = req.body;
+    
+    if (!name || name.trim().length === 0) {
+      return res.status(400).json({ message: 'Name is required' });
+    }
+    
+    req.user.name = name.trim();
+    await req.user.save();
+    
+    res.json({ 
+      message: 'Profile updated successfully',
+      user: req.user
+    });
+  } catch (error) {
+    console.error('Profile update error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Protected route example
+app.get('/api/protected', authenticateToken, (req, res) => {
+  res.json({ 
+    message: 'This is a protected route',
+    user: req.user
+  });
+});
+
+// Forgot Password - send OTP
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    const otp = generateOTP();
+    const otpExpiry = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+    user.otp = otp;
+    user.otpExpiry = otpExpiry;
+    user.otpType = 'reset';
+    await user.save();
+    await sendOTPEmail(user.email, otp, 'reset');
+    res.json({ message: 'OTP sent to your email for password reset.' });
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Verify OTP for password reset
+app.post('/api/auth/verify-reset-otp', async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp) {
+      return res.status(400).json({ message: 'Email and OTP are required' });
+    }
+    const user = await User.findOne({ email });
+    if (!user || user.otp !== otp || user.otpType !== 'reset') {
+      return res.status(401).json({ message: 'Invalid OTP' });
+    }
+    if (!user.otpExpiry || user.otpExpiry < new Date()) {
+      return res.status(401).json({ message: 'OTP expired' });
+    }
+    // Mark OTP as verified (but keep it for reset)
+    user.otpType = 'reset-verified';
+    await user.save();
+    res.json({ message: 'OTP verified. You can now reset your password.' });
+  } catch (error) {
+    console.error('Verify reset OTP error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Reset Password
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { email, otp, newPassword } = req.body;
+    if (!email || !otp || !newPassword) {
+      return res.status(400).json({ message: 'Email, OTP, and new password are required' });
+    }
+    const user = await User.findOne({ email });
+    if (!user || user.otp !== otp || user.otpType !== 'reset-verified') {
+      return res.status(401).json({ message: 'Invalid or unverified OTP' });
+    }
+    if (!user.otpExpiry || user.otpExpiry < new Date()) {
+      return res.status(401).json({ message: 'OTP expired' });
+    }
+    // Validate new password
+    const passwordValidation = validatePassword(newPassword);
+    if (!passwordValidation.isValid) {
+      return res.status(400).json({ 
+        message: 'Password validation failed',
+        errors: passwordValidation.errors
+      });
+    }
+    // Hash new password
+    const saltRounds = 12;
+    const hashedPassword = await bcrypt.hash(newPassword, saltRounds);
+    user.password = hashedPassword;
+    // Clear OTP fields
+    user.otp = null;
+    user.otpExpiry = null;
+    user.otpType = null;
+    await user.save();
+    res.json({ message: 'Password reset successful. You can now log in.' });
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Create payment order
+app.post('/api/payment/create-order', authenticateToken, async (req, res) => {
+  try {
+    const options = {
+      amount: 100, // ₹1 in paise (100 paise = ₹1)
+      currency: 'INR',
+      receipt: `order_${Date.now()}_${req.user._id}`,
+      notes: {
+        userId: req.user._id.toString(),
+        purpose: 'group_chat_access'
+      }
+    };
+
+    const order = await razorpay.orders.create(options);
+    
+    res.json({
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      keyId: razorpay.key_id
+    });
+  } catch (error) {
+    console.error('Order creation error:', error);
+    res.status(500).json({ message: 'Failed to create payment order' });
+  }
+});
+
+// Verify payment and mark user as group member
+app.post('/api/payment/verify', authenticateToken, async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+
+    // Verify payment signature
+    const text = `${razorpay_order_id}|${razorpay_payment_id}`;
+    const crypto = require('crypto');
+    const signature = crypto
+      .createHmac('sha256', razorpay.key_secret)
+      .update(text)
+      .digest('hex');
+
+    if (signature !== razorpay_signature) {
+      return res.status(400).json({ message: 'Invalid payment signature' });
+    }
+
+    // Mark user as group member
+    req.user.isGroupMember = true;
+    await req.user.save();
+
+    res.json({ 
+      message: 'Payment successful! You can now access the group chat.',
+      isGroupMember: true
+    });
+  } catch (error) {
+    console.error('Payment verification error:', error);
+    res.status(500).json({ message: 'Payment verification failed' });
+  }
+});
+
+// Get payment status (for checking if user is already a member)
+app.get('/api/payment/status', authenticateToken, (req, res) => {
+  res.json({ 
+    isGroupMember: req.user.isGroupMember || false
+  });
+});
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ message: 'Server is running' });
+});
+
+// Create HTTP server and Socket.IO
+const server = require('http').createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    credentials: true
+  }
+});
+
+// Socket.IO authentication middleware
+const authenticateSocket = async (socket, next) => {
+  try {
+    const token = socket.handshake.auth.token;
+    if (!token) {
+      return next(new Error('Authentication error'));
+    }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const user = await User.findById(decoded.userId).select('-password');
+    
+    if (!user || !user.isGroupMember) {
+      return next(new Error('Access denied'));
+    }
+    
+    socket.user = user;
+    next();
+  } catch (error) {
+    next(new Error('Authentication error'));
+  }
+};
+
+// Socket.IO connection handling
+io.use(authenticateSocket);
+
+const onlineUsers = new Map(); // userId -> socket
+
+io.on('connection', (socket) => {
+  const user = socket.user;
+  onlineUsers.set(user._id.toString(), socket);
+  
+  // Join group chat room
+  socket.join('group-chat');
+  
+  // Broadcast user joined
+  socket.to('group-chat').emit('userJoined', {
+    userId: user._id,
+    name: user.name,
+    profilePic: user.profilePic
+  });
+  
+  // Send current online users to new user
+  const onlineUsersList = Array.from(onlineUsers.keys()).map(userId => {
+    const userSocket = onlineUsers.get(userId);
+    return {
+      userId: userSocket.user._id,
+      name: userSocket.user.name,
+      profilePic: userSocket.user.profilePic
+    };
+  });
+  socket.emit('onlineUsers', onlineUsersList);
+  
+  // Handle text messages
+  socket.on('sendMessage', (message) => {
+    io.to('group-chat').emit('newMessage', {
+      userId: user._id,
+      name: user.name,
+      profilePic: user.profilePic,
+      message: message,
+      type: 'text',
+      timestamp: new Date()
+    });
+  });
+  
+  // Handle file uploads
+  socket.on('uploadFile', async (fileData) => {
+    try {
+      const { file, fileName, fileType } = fileData;
+      
+      // Upload to Cloudinary
+      const streamUpload = (fileBuffer) => {
+        return new Promise((resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            { 
+              folder: 'chat_files',
+              resource_type: 'auto',
+              allowed_formats: ['jpg', 'jpeg', 'png', 'gif', 'mp4', 'mov', 'avi', 'pdf', 'doc', 'docx']
+            },
+            (error, result) => {
+              if (result) {
+                resolve(result);
+              } else {
+                reject(error);
+              }
+            }
+          );
+          streamifier.createReadStream(fileBuffer).pipe(stream);
+        });
+      };
+      
+      const result = await streamUpload(Buffer.from(file, 'base64'));
+      
+      // Broadcast file to all users
+      io.to('group-chat').emit('newMessage', {
+        userId: user._id,
+        name: user.name,
+        profilePic: user.profilePic,
+        message: {
+          fileName: fileName,
+          fileUrl: result.secure_url,
+          fileType: fileType
+        },
+        type: 'file',
+        timestamp: new Date()
+      });
+      
+    } catch (error) {
+      console.error('File upload error:', error);
+      socket.emit('uploadError', { message: 'File upload failed' });
+    }
+  });
+  
+  // Handle disconnection
+  socket.on('disconnect', () => {
+    onlineUsers.delete(user._id.toString());
+    socket.to('group-chat').emit('userLeft', {
+      userId: user._id,
+      name: user.name
+    });
+  });
+});
+
+
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});

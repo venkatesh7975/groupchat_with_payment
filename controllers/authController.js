@@ -146,9 +146,8 @@ const verifyOTP = async (req, res) => {
     // Set cookie (not HttpOnly so frontend can read it)
     res.cookie('token', token, {
       httpOnly: false, // Allow JavaScript to read the cookie
-      secure: false, // Allow HTTP for localhost
-      sameSite: 'lax', // More permissive for localhost
-      domain: 'localhost', // Explicitly set domain
+      secure: process.env.NODE_ENV === 'production', // Use secure in production
+      sameSite: 'lax', // More permissive for cross-origin
       path: '/', // Set path
       maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
     });
@@ -175,7 +174,10 @@ const verifyOTP = async (req, res) => {
 
 // Logout
 const logout = (req, res) => {
-  res.clearCookie('token');
+  res.clearCookie('token', {
+    path: '/',
+    sameSite: 'lax'
+  });
   res.json({ message: 'Logged out successfully' });
 };
 

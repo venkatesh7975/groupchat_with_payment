@@ -27,7 +27,9 @@ const PORT = process.env.PORT || 5000;
 // ✅ Define allowed origins for CORS
 const allowedOrigins = [
   'http://localhost:5173',                    // local frontend (Vite dev server)
-  'https://groupchat-frontend.vercel.app'      // production frontend (Vercel)
+  'http://localhost:3000',                    // alternative local frontend port
+  'https://groupchat-frontend.vercel.app',    // production frontend (Vercel)
+  'https://your-frontend-domain.com'          // add your actual frontend domain here
 ];
 
 // ✅ CORS Middleware
@@ -37,10 +39,17 @@ app.use(cors({
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'));
+      // In development, allow any origin for easier testing
+      if (process.env.NODE_ENV !== 'production') {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
     }
   },
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie']
 }));
 
 // ✅ Other middlewares
@@ -64,8 +73,21 @@ app.get('/api/health', (req, res) => {
 // ✅ Socket.IO setup
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
-    credentials: true
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        // In development, allow any origin for easier testing
+        if (process.env.NODE_ENV !== 'production') {
+          callback(null, true);
+        } else {
+          callback(new Error('Not allowed by CORS'));
+        }
+      }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Cookie']
   }
 });
 

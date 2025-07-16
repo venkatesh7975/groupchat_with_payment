@@ -13,7 +13,7 @@ dist
 setup-env.js
 dist-ssr
 *.local
-
+./setup-env.js
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

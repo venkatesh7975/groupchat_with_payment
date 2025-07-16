@@ -11,7 +11,7 @@ MONGODB_URI=mongodb+srv://mvenky9100:Venkatesh7975@groupchat.1u8swih.mongodb.net
 JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
 
 # Frontend URL (for CORS)
-FRONTEND_URL=https://groupchat-frontend.vercel.app/
+FRONTEND_URL=http://localhost:5173/
 CLOUDINARY_CLOUD_NAME=dapdgihj2
 CLOUDINARY_API_KEY=925719585822326
 CLOUDINARY_API_SECRET=_JcfGPqeC4p1Uc_dE6W7shADF-8
